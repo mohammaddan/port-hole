@@ -99,7 +99,7 @@ python main.py
 
 ## 🚀 How to use
 
-![Screenshot placeholder](Port-Hole-Screenshot.png)
+![Screenshot placeholder](Port-Hole-Screenshot2.png)
 
 1. **Select Docker context** from the dropdown (all contexts shown via `docker context ls`).
 2. **Choose a running container** – the list updates automatically (type to search).

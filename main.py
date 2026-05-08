@@ -1,46 +1,49 @@
 #!/usr/bin/env python3
 """
-Docker Internal Port Forwarder – Elegant GUI with searchable container list,
-logs viewer, terminal access, and unpublished port forwarding.
+PortHole – Docker Port Forwarder
+Modern UI with PySide6, full functionality (socat proxy + SSH tunnel)
 """
 
-import sys
-import threading
+import os
 import socket
 import subprocess
-import json
+import sys
+import threading
 import time
-import paramiko
+
 import docker
-import os
-from PyQt6.QtWidgets import (
+import paramiko
+from PySide6.QtCore import Qt, QSize, QThread, Signal, QUrl
+from PySide6.QtGui import QFont, QIcon, QPixmap, QDesktopServices
+from PySide6.QtWidgets import (
     QApplication,
+    QMainWindow,
     QWidget,
-    QVBoxLayout,
-    QHBoxLayout,
+    QFrame,
     QLabel,
     QPushButton,
-    QComboBox,
-    QLineEdit,
-    QMessageBox,
+    QVBoxLayout,
+    QHBoxLayout,
     QListWidget,
     QListWidgetItem,
+    QLineEdit,
+    QComboBox,
+    QGridLayout,
+    QMessageBox,
     QTextEdit,
     QDialog,
     QCheckBox,
-    QGroupBox,
-    QCompleter,
-    QProgressBar,
 )
-from PyQt6.QtCore import QThread, pyqtSignal, Qt, QStringListModel
-from PyQt6.QtGui import QIcon, QPixmap
-from PyQt6.QtGui import QFont, QIcon
+
+from container_load_thread import ContainerLoaderThread
 
 
-# ---------- Logs streaming thread ----------
+# ------------------------------------------------------------
+# Logs streaming thread (PySide6 version)
+# ------------------------------------------------------------
 class LogsThread(QThread):
-    line_received = pyqtSignal(str)
-    finished = pyqtSignal()
+    line_received = Signal(str)
+    finished = Signal()
 
     def __init__(self, docker_client, container_id, follow=True):
         super().__init__()
@@ -127,66 +130,153 @@ class LogViewerDialog(QDialog):
         event.accept()
 
 
-# ---------- Main application ----------
-class DockerPortForwarder(QWidget):
-
+# ------------------------------------------------------------
+# Main application
+# ------------------------------------------------------------
+class PortHoleWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         logo_path = os.path.join(os.path.dirname(__file__), "PortHole.png")
         if os.path.exists(logo_path):
             self.setWindowIcon(QIcon(logo_path))
-        self.setWindowTitle("PortHole (Remote Docker Unpublished Port Forwarder)")
-        self.setGeometry(200, 200, 800, 600)
+        self.loader_thread = None
+        self.all_containers = []
+        self.loading = False
+        self.setWindowTitle("PortHole – Docker Port Forwarder")
+        self.resize(1400, 900)
 
-        # Apply a clean stylesheet
         self.setStyleSheet(
             """
-            QGroupBox {
-                font-weight: bold;
-                border: 1px solid #ccc;
-                border-radius: 5px;
-                margin-top: 10px;
+            QWidget {
+                background-color: #0d0f12;
+                color: #f2f2f2;
+                font-family: Inter, Roboto, sans-serif;
+                font-size: 14px;
             }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 5px 0 5px;
+            QMainWindow {
+                background-color: #0d0f12;
+            }
+            QLabel {
+                background: transparent;
+            }
+            QFrame#sidebar {
+                background-color: #111418;
+                border-right: 1px solid #1d232a;
+            }
+            QFrame#topbar {
+                background-color: #0f1317;
+                border-bottom: 1px solid #1d232a;
+            }
+            QFrame#card {
+                background-color: #12161b;
+                border: 1px solid #1d232a;
+                border-radius: 14px;
+            }
+            QFrame#activeCard {
+                background-color: #101419;
+                border: 1px solid #1e2a22;
+                border-radius: 14px;
             }
             QPushButton {
-                background-color: #4CAF50;
-                color: white;
-                border: none;
-                padding: 6px 12px;
-                border-radius: 4px;
+                background-color: #1a1f25;
+                border: 1px solid #2a3138;
+                border-radius: 6px;
+                padding: 4px 9px;
+                color: #f5f5f5;
             }
             QPushButton:hover {
-                background-color: #45a049;
+                border: 1px solid #4CAF50;
             }
-            QPushButton:disabled {
-                background-color: #cccccc;
+            QPushButton#greenButton {
+                background-color: #4CAF50;
+                color: white;
+                font-weight: 600;
+                border: none;
+            }
+            QPushButton#greenButton:hover {
+                background-color: #5dc761;
+            }
+            QPushButton#dangerButton {
+                background-color: #2a1414;
+                color: #ff6b6b;
+                border: 1px solid #6d2323;
+            }
+            QPushButton#dangerButton:hover {
+                background-color: #3a1919;
             }
             QLineEdit, QComboBox {
+                background-color: #181d22;
+                border: 1px solid #2b333b;
+                border-radius: 6px;
                 padding: 4px;
-                border-radius: 3px;
-                border: 1px solid #aaa;
-                background-color: #eee;
+                color: #f2f2f2;
+                min-height: 16px;
+            }
+            QListWidget {
+                background: transparent;
+                border: none;
+                outline: none;
             }
             QListWidget::item {
-                padding: 5px;
+                background-color: #12161b;
+                border: 1px solid #1d232a;
+                border-radius: 8px;
+                margin-bottom: 5px;
+                padding: 7px;
+            }
+            QListWidget::item:selected {
+                border: 1px solid #4CAF50;
+                background-color: #151d17;
             }
         """
         )
 
+        # Data structures (same as main.py)
         self.clients = {}  # Docker clients per context
         self.active_forwards = {}  # local_port -> forward_info
         self.contexts = self.get_docker_contexts()
-        self.main_layout = QVBoxLayout()
-        self.main_layout.setSpacing(15)
-        self.main_layout.setContentsMargins(15, 15, 15, 15)
+        self.current_container_id = None
 
-        # ---------- Header with logo and title ----------
-        header_layout = QHBoxLayout()
-        # Logo (SVG)
+        # Build UI
+        root = QWidget()
+        self.setCentralWidget(root)
+        root_layout = QHBoxLayout(root)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+
+        self.sidebar = self.build_sidebar()
+        self.content = self.build_content()
+        root_layout.addWidget(self.sidebar)
+        root_layout.addWidget(self.content)
+
+        # Initially populate containers
+        self.refresh_containers()
+
+    # ------------------------------------------------------------
+    # UI Construction
+    # ------------------------------------------------------------
+    def build_sidebar(self):
+        sidebar = QFrame()
+        sidebar.setObjectName("sidebar")
+        sidebar.setFixedWidth(360)
+
+        layout = QVBoxLayout(sidebar)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(18)
+
+        # ---------- Header with fixed height ----------
+        header_widget = QWidget()
+        header_widget.setFixedHeight(80)
+        header_widget.setStyleSheet('background-color: transparent;')
+        header_layout = QHBoxLayout(header_widget)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+
+        logo_path = os.path.join(os.path.dirname(__file__), "PortHole.png")
+        if os.path.exists(logo_path):
+            self.setWindowIcon(QIcon(logo_path))
+        # Logo + title
+        logo_row = QHBoxLayout()
+
         if os.path.exists(logo_path):
             pixmap = QPixmap(logo_path)
             pixmap = pixmap.scaled(
@@ -197,136 +287,220 @@ class DockerPortForwarder(QWidget):
             )
             logo_label = QLabel()  # Create a QLabel
             logo_label.setPixmap(pixmap)  # Set the pixmap on the label
-            header_layout.addWidget(logo_label)  # Add the label, not the pixmap
-        # Title text
-        title_label = QLabel(
-            "<h1>PortHole</h1><i>Forward unpublished container ports</i>"
-        )
-        header_layout.addWidget(title_label)
+            header_layout.addWidget(logo_label)
+
+        # logo_row.addWidget(logo)
+        title_layout = QVBoxLayout()
+        title = QLabel("PortHole")
+        title.setStyleSheet("font-size:32px;font-weight:700;")
+        subtitle = QLabel("Docker Port Forwarder")
+        subtitle.setStyleSheet("color:#9aa4af;font-size:14px;")
+        title_layout.setSpacing(10)
+        title_layout.addWidget(title)
+        title_layout.addWidget(subtitle)
+        header_layout.addLayout(title_layout)
         header_layout.addStretch()
-        self.main_layout.addLayout(header_layout)
+        layout.addWidget(header_widget)
 
-        # ---------- Connection group ----------
-        conn_group = QGroupBox("Docker Connection")
-        conn_layout = QVBoxLayout()
-        context_layout = QHBoxLayout()
-        context_layout.addWidget(QLabel("Context:"))
-        self.env_combo = QComboBox()
-        for name, endpoint in self.contexts.items():
-            self.env_combo.addItem(f"{name} ({endpoint})", name)
-        self.env_combo.currentIndexChanged.connect(self.refresh_containers)
-        context_layout.addWidget(self.env_combo)
-        context_layout.addStretch()
-        self.refresh_containers_btn = QPushButton("🔄 Refresh Containers")
+        # Search field (filter containers)
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search containers...")
+        self.search_input.textChanged.connect(self.filter_container_list)
+        layout.addWidget(self.search_input)
+
+        # Container list
+        self.container_list = QListWidget()
+        self.container_list.itemSelectionChanged.connect(self.on_container_selected)
+        self.container_list.setIconSize(QSize(48, 48))
+        self.container_list.setMinimumHeight(200)
+        layout.addWidget(self.container_list)
+
+        self.loading_label = QLabel("Loading containers...")
+        self.loading_label.setStyleSheet("color:#ddcc00;padding:20px;font-size:24px;font-weight:600;")
+        self.loading_label.setVisible(False)
+        layout.addWidget(self.loading_label)
+
+        # Footer (context info)
+        footer = QFrame()
+        footer.setObjectName("card")
+        footer_layout = QVBoxLayout(footer)
+        self.connected_label = QLabel("● Connected")
+        self.connected_label.setStyleSheet(
+            "color:#4CAF50;font-weight:600;font-size:16px;"
+        )
+        self.context_label = QLabel("No context")
+        self.context_label.setStyleSheet("color:#9aa4af;line-height:22px;")
+        footer_layout.addWidget(self.connected_label)
+        footer_layout.addWidget(self.context_label)
+        layout.addWidget(footer)
+
+        return sidebar
+
+    def build_content(self):
+        wrapper = QWidget()
+        layout = QVBoxLayout(wrapper)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
+
+        # Topbar
+        topbar = QFrame()
+        topbar.setObjectName("topbar")
+        topbar_layout = QHBoxLayout(topbar)
+        topbar_layout.setContentsMargins(11, 9, 11, 9)
+
+        self.context_combo = QComboBox()
+        self.context_combo.setMinimumWidth(360)
+        self.context_combo.currentIndexChanged.connect(self.on_context_changed)
+        topbar_layout.addWidget(self.context_combo)
+
+        self.status_label = QLabel("● Connected")
+        self.status_label.setStyleSheet("color:#4CAF50;font-size:14px;font-weight:600;")
+        topbar_layout.addSpacing(12)
+        topbar_layout.addWidget(self.status_label)
+        topbar_layout.addStretch()
+
+        self.refresh_containers_btn = QPushButton("Refresh")
         self.refresh_containers_btn.clicked.connect(self.refresh_containers)
-        context_layout.addWidget(self.refresh_containers_btn)
-        conn_layout.addLayout(context_layout)
-        conn_group.setLayout(conn_layout)
-        self.main_layout.addWidget(conn_group)
+        topbar_layout.addWidget(self.refresh_containers_btn)
+        settings_btn = QPushButton("⚙")
+        settings_btn.setFixedWidth(52)
+        topbar_layout.addWidget(settings_btn)
 
-        # ---------- Container selection + actions ----------
-        container_group = QGroupBox("Container Operations")
-        container_layout = QVBoxLayout()
+        layout.addWidget(topbar)
 
-        # Searchable container combo
-        container_select_layout = QHBoxLayout()
-        container_select_layout.addWidget(QLabel("Container:"))
-        self.container_combo = QComboBox()
-        self.container_combo.setEditable(True)
-        self.container_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        self.container_combo.setMinimumWidth(350)
-        container_select_layout.addWidget(self.container_combo)
-        container_select_layout.addStretch()
-        container_layout.addLayout(container_select_layout)
+        # Summary card (container details)
+        self.summary_card = QFrame()
+        self.summary_card.setObjectName("card")
+        self.summary_card_layout = QHBoxLayout(self.summary_card)
+        self.summary_card_layout.setContentsMargins(14, 14, 14, 14)
 
-        # Action buttons
-        action_buttons_layout = QHBoxLayout()
-        self.logs_btn = QPushButton("📄 View Logs")
-        self.logs_btn.clicked.connect(self.view_logs)
-        self.terminal_btn = QPushButton("💻 Open Terminal")
-        self.terminal_btn.clicked.connect(self.open_terminal)
-        action_buttons_layout.addWidget(self.logs_btn)
-        action_buttons_layout.addWidget(self.terminal_btn)
-        action_buttons_layout.addStretch()
-        container_layout.addLayout(action_buttons_layout)
-        container_group.setLayout(container_layout)
-        self.main_layout.addWidget(container_group)
+        left = QVBoxLayout()
+        left.setSpacing(10)
+        self.summary_title = QLabel("Select a container")
+        self.summary_title.setStyleSheet("font-size:24px;font-weight:700;")
+        self.summary_id = QLabel("")
+        self.summary_id.setStyleSheet("color:#93a0ab;font-size:16px;")
+        self.summary_meta = QLabel("")
+        self.summary_meta.setStyleSheet("color:#9aa4af;font-size:16px;")
+        self.summary_ports = QLabel("")
+        self.summary_ports.setStyleSheet(
+            "color:#4CAF50;font-size:15px;font-weight:600;"
+        )
+        left.addWidget(self.summary_title)
+        left.addWidget(self.summary_id)
+        left.addSpacing(4)
+        left.addWidget(self.summary_meta)
+        left.addWidget(self.summary_ports)
 
-        # ---------- Port forwarding group ----------
-        forward_group = QGroupBox("Port Forwarding (without publishing)")
-        forward_layout = QVBoxLayout()
+        actions = QVBoxLayout()
+        actions.setSpacing(4)
+        logs_btn = QPushButton("View Logs")
+        logs_btn.clicked.connect(self.view_logs)
+        terminal_btn = QPushButton("Open Terminal")
+        terminal_btn.clicked.connect(self.open_terminal)
+        actions.addWidget(logs_btn)
+        actions.addWidget(terminal_btn)
+        actions.addStretch()
 
-        # Internal port
-        internal_layout = QHBoxLayout()
-        internal_layout.addWidget(QLabel("Container internal port:"))
-        self.target_port_input = QLineEdit()
-        self.target_port_input.setPlaceholderText("e.g. 6379")
-        internal_layout.addWidget(self.target_port_input)
-        forward_layout.addLayout(internal_layout)
+        self.summary_card_layout.addLayout(left)
+        self.summary_card_layout.addStretch()
+        self.summary_card_layout.addLayout(actions)
+        layout.addWidget(self.summary_card)
 
-        # Local port
-        local_layout = QHBoxLayout()
-        local_layout.addWidget(QLabel("Local port on your machine:"))
+        # Port forwarding card
+        forward_card = QFrame()
+        forward_card.setObjectName("card")
+        forward_layout = QVBoxLayout(forward_card)
+        forward_layout.setContentsMargins(14, 14, 14, 14)
+        forward_layout.setSpacing(24)
+
+        forward_title = QLabel("PORT FORWARDING (without publishing)")
+        forward_title.setStyleSheet("font-size:18px;font-weight:700;")
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(8)
+
+        internal_label = QLabel("Container internal port")
+        local_label = QLabel("Local port on your machine")
+        host_label = QLabel("Bind address")
+
+        self.internal_port_combo = QComboBox()
+        self.internal_port_combo.setEditable(True)
+        self.internal_port_combo.setPlaceholderText("Select or type port")
+
         self.local_port_input = QLineEdit()
         self.local_port_input.setPlaceholderText("e.g. 6380")
-        local_layout.addWidget(self.local_port_input)
-        forward_layout.addLayout(local_layout)
 
-        # Remote port (optional)
-        # remote_layout = QHBoxLayout()
-        # remote_layout.addWidget(
-        #     QLabel("Optional remote host port (leave empty for random):")
-        # )
-        # self.remote_port_input = QLineEdit()
-        # self.remote_port_input.setPlaceholderText("e.g. 16379")
-        # remote_layout.addWidget(self.remote_port_input)
-        # forward_layout.addLayout(remote_layout)
+        self.bind_host_combo = QComboBox()
+        self.bind_host_combo.addItems(["localhost", "127.0.0.1"])
 
-        # Forward button
-        self.forward_button = QPushButton("🚀 Start Port Forward")
-        self.forward_button.clicked.connect(self.start_port_forward)
-        forward_layout.addWidget(self.forward_button)
+        grid.addWidget(internal_label, 0, 0)
+        grid.addWidget(local_label, 0, 1)
+        grid.addWidget(host_label, 0, 2)
+        grid.addWidget(self.internal_port_combo, 1, 0)
+        grid.addWidget(self.local_port_input, 1, 1)
+        grid.addWidget(self.bind_host_combo, 1, 2)
 
-        forward_group.setLayout(forward_layout)
-        self.main_layout.addWidget(forward_group)
+        # Advanced options (collapsible – we keep it simple)
+        self.advanced_btn = QPushButton(
+            "Advanced options (remote host port, auto reconnect...)"
+        )
+        self.advanced_btn.setCheckable(True)
+        self.advanced_widget = QWidget()
+        self.advanced_widget.setVisible(False)
+        adv_layout = QHBoxLayout(self.advanced_widget)
+        adv_layout.addWidget(QLabel("Remote host port:"))
+        self.remote_port_input = QLineEdit()
+        self.remote_port_input.setPlaceholderText("random")
+        adv_layout.addWidget(self.remote_port_input)
+        self.advanced_btn.toggled.connect(self.advanced_widget.setVisible)
 
-        # ---------- Active forwards list ----------
-        active_group = QGroupBox("Active Forwards")
-        active_layout = QVBoxLayout()
-        self.active_list = QListWidget()
-        active_layout.addWidget(self.active_list)
-        active_group.setLayout(active_layout)
-        self.main_layout.addWidget(active_group)
+        start_btn = QPushButton("Start Tunnel")
+        start_btn.setObjectName("greenButton")
+        start_btn.setMinimumHeight(36)
+        start_btn.setFont(QFont("Inter", 14, QFont.Weight.Bold))
+        start_btn.clicked.connect(self.start_port_forward)
 
-        self.setLayout(self.main_layout)
+        forward_layout.addWidget(forward_title)
+        forward_layout.addLayout(grid)
+        forward_layout.addWidget(self.advanced_btn)
+        forward_layout.addWidget(self.advanced_widget)
+        forward_layout.addWidget(start_btn)
 
-        # Initially populate containers
-        self.refresh_containers()
+        layout.addWidget(forward_card)
 
-        # Setup searchable combo completer
-        self.setup_container_completer()
+        # Active tunnels card
+        self.active_card = QFrame()
+        self.active_card.setObjectName("activeCard")
+        active_layout = QVBoxLayout(self.active_card)
+        active_layout.setContentsMargins(14, 14, 14, 14)
+        active_layout.setSpacing(14)
 
-    def setup_container_completer(self):
-        """Add a completer to the container combo for search as you type."""
-        completer = QCompleter()
-        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-        completer.setFilterMode(Qt.MatchFlag.MatchContains)
-        self.container_combo.setCompleter(completer)
-        # Update completer model whenever the combo items change
-        self.container_combo.model().rowsInserted.connect(self.update_completer_model)
-        self.container_combo.model().rowsRemoved.connect(self.update_completer_model)
-        self.update_completer_model()
+        header = QHBoxLayout()
+        active_title = QLabel("ACTIVE TUNNELS")
+        active_title.setStyleSheet("font-size:22px;font-weight:700;")
+        self.active_badge = QLabel("0 active")
+        self.active_badge.setStyleSheet(
+            "background-color:#18311d; color:#6fe273; border-radius:10px; padding:6px 12px; font-weight:600;"
+        )
+        header.addWidget(active_title)
+        header.addStretch()
+        header.addWidget(self.active_badge)
 
-    def update_completer_model(self, *args):
-        """Update the completer with current container names."""
-        items = [
-            self.container_combo.itemText(i)
-            for i in range(self.container_combo.count())
-        ]
-        model = QStringListModel(items)
-        self.container_combo.completer().setModel(model)
+        self.tunnels_list = (
+            QListWidget()
+        )  # Will hold custom widgets for each active tunnel
+        active_layout.addLayout(header)
+        active_layout.addWidget(self.tunnels_list)
 
-    # ---------- Docker context helpers ----------
+        layout.addWidget(self.active_card)
+
+        return wrapper
+
+    # ------------------------------------------------------------
+    # Docker backend (copied/adapted from main.py)
+    # ------------------------------------------------------------
     def get_docker_contexts(self):
         contexts = {}
         try:
@@ -371,59 +545,222 @@ class DockerPortForwarder(QWidget):
             raise ValueError(f"Only SSH contexts are supported (got {endpoint})")
 
     def refresh_containers(self):
-        self.container_combo.clear()
-        context_name = self.env_combo.currentData()
+        # Update context combo box
+        self.context_combo.clear()
+        for name, endpoint in self.contexts.items():
+            self.context_combo.addItem(f"{name} ({endpoint})", name)
+        if self.context_combo.count() > 0:
+            self.context_combo.setCurrentIndex(0)
+            self.on_context_changed()
+
+    def on_context_changed(self):
+        context_name = self.context_combo.currentData()
+        if not context_name:
+            return
+        # Update sidebar footer
+        endpoint = self.contexts.get(context_name, "unknown")
+        self.context_label.setText(f"{context_name}\n{endpoint}")
+        self.connected_label.setText("● Connected")
+        self.status_label.setText("● Connected")
+
+        # Load containers
+        self.load_container_list()
+
+    def load_container_list(self):
+        if self.loading:
+            return  # already loading
+        context_name = self.context_combo.currentData()
         if not context_name:
             return
         try:
             docker_client, _, _ = self.get_docker_client_and_ssh_info(context_name)
-            containers = docker_client.containers.list(filters={"status": "running"})
-            for c in containers:
-                self.container_combo.addItem(f"{c.name} ({c.short_id})", c.id)
-            # Cache the client for later use
             self.clients[context_name] = docker_client
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to list containers:\n{e}")
 
-    # ---------- Logs and terminal ----------
-    def view_logs(self):
-        container_id = self.container_combo.currentData()
-        if not container_id:
-            QMessageBox.warning(
-                self, "No container", "Please select a running container."
-            )
+            # Stop previous thread if it's still running
+            if self.loader_thread and self.loader_thread.isRunning():
+                self.loader_thread.stop()
+                self.loader_thread.quit()
+                self.loader_thread.wait(1000)
+                self.loader_thread.deleteLater()
+                self.loader_thread = None
+
+            # Show loading indicator
+            self.loading = True
+            self.container_list.clear()
+            self.loading_label.setVisible(True)
+            self.container_list.setVisible(False)
+            self.search_input.setVisible(False)
+            self.search_input.setEnabled(False)
+            self.context_combo.setEnabled(False)
+            self.refresh_containers_btn.setEnabled(False)
+
+            # Start background loading
+            self.loader_thread = ContainerLoaderThread(docker_client)
+            self.loader_thread.containers_loaded.connect(self.on_containers_loaded)
+            self.loader_thread.error_occurred.connect(self.on_container_load_error)
+            self.loader_thread.start()
+        except Exception as e:
+            self.loading = False
+            QMessageBox.critical(self, "Error", f"Failed to list containers:\n{e}")
+            self.loading_label.setVisible(False)
+            self.container_list.setVisible(True)
+            self.search_input.setEnabled(True)
+            self.context_combo.setEnabled(True)
+            self.refresh_containers_btn.setEnabled(True)
+
+    def on_containers_loaded(self, containers):
+        self.all_containers = containers
+        self.container_list.clear()
+        for display, cid, container,logo in containers:
+            item = QListWidgetItem(display)
+            if logo:
+                item.setIcon(QIcon(logo))
+            self.container_list.addItem(item)
+        self.filter_container_list()
+        self.loading_label.setVisible(False)
+        self.container_list.setVisible(True)
+        self.search_input.setEnabled(True)
+        self.search_input.setVisible(True)
+        self.context_combo.setEnabled(True)
+        if hasattr(self, 'refresh_containers_btn'):
+            self.refresh_containers_btn.setEnabled(True)
+        self.loading = False
+        if self.container_list.count() > 0:
+            self.container_list.setCurrentRow(0)
+
+    def on_container_load_error(self, error_msg):
+        self.loading_label.setVisible(False)
+        self.container_list.setVisible(True)
+        self.search_input.setEnabled(True)
+        self.context_combo.setEnabled(True)
+        if hasattr(self, 'refresh_containers_btn'):
+            self.refresh_containers_btn.setEnabled(True)
+        self.loading = False
+        QMessageBox.critical(self, "Error", f"Failed to load containers:\n{error_msg}")
+
+    def closeEvent(self, event):
+        if self.loader_thread and self.loader_thread.isRunning():
+            self.loader_thread.quit()
+            self.loader_thread.wait(2000)
+        event.accept()
+
+    def filter_container_list(self):
+        filter_text = self.search_input.text().lower()
+        self.container_list.clear()
+        for display, cid, container,logo in self.all_containers:
+            if filter_text in display.lower():
+                item = QListWidgetItem(display)
+                if logo:
+                    item.setIcon(QIcon(logo))
+                self.container_list.addItem(item)
+
+        if self.container_list.count() > 0:
+            self.container_list.setCurrentRow(0)
+
+    def on_container_selected(self):
+        current = self.container_list.currentItem()
+        if not current:
             return
-        context_name = self.env_combo.currentData()
+        display = current.text()
+        # Find container id from stored list
+        for d, cid, container,logo in self.all_containers:
+            if d == display:
+                self.current_container_id = cid
+                self.update_container_details(container)
+                break
+
+    def update_container_details(self, container):
+        """Update the summary card with container info and populate internal ports."""
+        attrs = container.attrs
+        name = container.name
+        image = attrs["Config"]["Image"]
+        status = container.status
+        started_at = attrs["State"]["StartedAt"]
+        created_at = attrs["Created"][:19]
+
+        # Detect internal listening ports (using docker exec ss)
+        ports_list = self.get_container_listening_ports(container.id)
+        if not ports_list:
+            # fallback to exposed ports
+            exposed = attrs["Config"].get("ExposedPorts", {})
+            ports_list = (
+                [port.split("/")[0] for port in exposed.keys()] if exposed else []
+            )
+
+        self.summary_title.setText(name)
+        self.summary_id.setText(container.short_id)
+        self.summary_meta.setText(
+            f"•Image: {image.split('@')[0]}\n•Status: {status}\n•Uptime: {started_at[:19]}"
+        )
+        self.summary_ports.setText(f"•Internal Ports:   {', '.join(ports_list)}")
+
+        # Populate internal port combo
+        self.internal_port_combo.clear()
+        for p in ports_list:
+            self.internal_port_combo.addItem(p, int(p))
+        if ports_list:
+            self.internal_port_combo.setCurrentIndex(0)
+
+    def get_container_listening_ports(self, container_id):
+        """Run ss inside container to find listening ports."""
         try:
-            docker_client, _, _ = self.get_docker_client_and_ssh_info(context_name)
-            container = docker_client.containers.get(container_id)
+            # Use docker exec (requires docker client on remote host)
+            # We'll use the docker API via the client
+            client = self.get_docker_client_for_current_context()
+            container = client.containers.get(container_id)
+            attrs = container.attrs
+            exposed_ports = attrs["Config"].get("ExposedPorts", {})
+            ports_list = (
+                [port.split("/")[0] for port in exposed_ports.keys()]
+                if exposed_ports
+                else ["No exposed ports"]
+            )
+            return ports_list
+        except Exception as e:
+            print(f"Could not detect listening ports: {e}")
+            return []
+
+    def get_docker_client_for_current_context(self):
+        context_name = self.context_combo.currentData()
+        if context_name in self.clients:
+            return self.clients[context_name]
+        else:
+            client, _, _ = self.get_docker_client_and_ssh_info(context_name)
+            self.clients[context_name] = client
+            return client
+
+    # ------------------------------------------------------------
+    # Logs and terminal
+    # ------------------------------------------------------------
+    def view_logs(self):
+        if not self.current_container_id:
+            QMessageBox.warning(self, "No container", "Please select a container.")
+            return
+        try:
+            docker_client = self.get_docker_client_for_current_context()
+            container = docker_client.containers.get(self.current_container_id)
             dialog = LogViewerDialog(self, docker_client, container.name, container.id)
             dialog.exec()
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Could not retrieve logs:\n{str(e)}")
 
     def open_terminal(self):
-        container_id = self.container_combo.currentData()
-        if not container_id:
-            QMessageBox.warning(
-                self, "No container", "Please select a running container."
-            )
+        if not self.current_container_id:
+            QMessageBox.warning(self, "No container", "Please select a container.")
             return
-        context_name = self.env_combo.currentData()
+        context_name = self.context_combo.currentData()
         try:
-            docker_client, ssh_host, ssh_user = self.get_docker_client_and_ssh_info(
-                context_name
-            )
+            _, ssh_host, ssh_user = self.get_docker_client_and_ssh_info(context_name)
             if not ssh_user:
                 ssh_user = "root"
-            container = docker_client.containers.get(container_id)
-            container_name = container.name
-
+            container_name = (
+                self.get_docker_client_for_current_context()
+                .containers.get(self.current_container_id)
+                .name
+            )
             ssh_cmd = (
                 f"ssh {ssh_user}@{ssh_host} -t 'docker exec -it {container_name} sh'"
             )
-            import shlex
-
             terminals = [
                 ("gnome-terminal", ["--", "bash", "-c", ssh_cmd]),
                 ("konsole", ["-e", "bash", "-c", ssh_cmd]),
@@ -431,7 +768,6 @@ class DockerPortForwarder(QWidget):
                 ("xterm", ["-e", "bash", "-c", ssh_cmd]),
                 ("urxvt", ["-e", "bash", "-c", ssh_cmd]),
             ]
-
             term_prog = None
             term_args = None
             for prog, args in terminals:
@@ -439,7 +775,6 @@ class DockerPortForwarder(QWidget):
                     term_prog = prog
                     term_args = args
                     break
-
             if term_prog:
                 subprocess.Popen([term_prog] + term_args, start_new_session=True)
             else:
@@ -449,7 +784,9 @@ class DockerPortForwarder(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to open terminal:\n{str(e)}")
 
-    # ---------- Port forward core (unchanged, robust) ----------
+    # ------------------------------------------------------------
+    # Port forward core (copied from main.py)
+    # ------------------------------------------------------------
     def create_socat_proxy(
         self, docker_client, target_ip, target_port, network_name, remote_port=None
     ):
@@ -505,6 +842,7 @@ class DockerPortForwarder(QWidget):
             self.server_socket = None
             self._stop_event = threading.Event()
             self._thread = None
+            self.all_containers = []
 
         def start(self):
             self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -563,21 +901,23 @@ class DockerPortForwarder(QWidget):
                 self._thread.join(timeout=1)
 
     def start_port_forward(self):
-        context_name = self.env_combo.currentData()
+        context_name = self.context_combo.currentData()
         if not context_name:
             QMessageBox.warning(self, "No context", "Select a Docker context.")
             return
-        container_id = self.container_combo.currentData()
-        if not container_id:
+        if not self.current_container_id:
             QMessageBox.warning(self, "No container", "Select a running container.")
             return
-        target_port_str = self.target_port_input.text().strip()
+
+        # Get target port
+        target_port_str = self.internal_port_combo.currentText().strip()
         if not target_port_str.isdigit():
             QMessageBox.warning(
                 self, "Invalid port", "Container internal port must be a number."
             )
             return
         target_port = int(target_port_str)
+
         local_port_str = self.local_port_input.text().strip()
         if not local_port_str.isdigit():
             QMessageBox.warning(self, "Invalid port", "Local port must be a number.")
@@ -586,9 +926,8 @@ class DockerPortForwarder(QWidget):
 
         import random
 
-        remote_port_str = str(random.randint(16000, 32000))
-        # remote_port_str = self.remote_port_input.text().strip()
-        remote_port = int(remote_port_str) if remote_port_str.isdigit() else None
+        remote_port_str = self.remote_port_input.text().strip()
+        remote_port = int(remote_port_str) if remote_port_str.isdigit() else random.randint(16000, 32000)
 
         if local_port in self.active_forwards:
             QMessageBox.warning(
@@ -603,7 +942,7 @@ class DockerPortForwarder(QWidget):
             if not ssh_user:
                 ssh_user = "root"
 
-            container = docker_client.containers.get(container_id)
+            container = docker_client.containers.get(self.current_container_id)
             networks = container.attrs["NetworkSettings"]["Networks"]
             if not networks:
                 QMessageBox.warning(
@@ -643,7 +982,7 @@ class DockerPortForwarder(QWidget):
                 "target_port": target_port,
             }
             self.active_forwards[local_port] = forward_info
-            self._add_active_forward_item(
+            self.add_active_tunnel_item(
                 local_port, container.name, target_port, context_name
             )
             QMessageBox.information(
@@ -654,25 +993,52 @@ class DockerPortForwarder(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to start forward:\n{str(e)}")
 
-    def _add_active_forward_item(
-        self, local_port, container_name, target_port, context_name
-    ):
-        item_widget = QWidget()
-        item_layout = QHBoxLayout()
-        item_layout.setContentsMargins(0, 0, 0, 0)
-        label = QLabel(
-            f"localhost:{local_port} → {container_name}:{target_port} (context: {context_name})"
-        )
-        stop_btn = QPushButton("Stop")
-        stop_btn.clicked.connect(lambda checked, lp=local_port: self.stop_forward(lp))
-        item_layout.addWidget(label)
-        item_layout.addWidget(stop_btn)
-        item_widget.setLayout(item_layout)
+    def add_active_tunnel_item(self, local_port, container_name, target_port, context_name):
+        """Add an active tunnel entry to the list with Stop and Open buttons."""
+        item = QListWidgetItem(self.tunnels_list)
+        item.setSizeHint(QSize(600, 120))
+        widget = QFrame()
+        widget.setObjectName("card")
+        layout = QHBoxLayout(widget)
+        layout.setContentsMargins(4, 4, 4, 4)
 
-        list_item = QListWidgetItem(self.active_list)
-        list_item.setSizeHint(item_widget.sizeHint())
-        self.active_list.addItem(list_item)
-        self.active_list.setItemWidget(list_item, item_widget)
+        info = QVBoxLayout()
+        info.setSpacing(4)
+        endpoint = QLabel(f"localhost:{local_port}  →  {container_name}:{target_port}")
+        endpoint.setStyleSheet("font-size:18px;font-weight:700;")
+        stats = QLabel(f"Context: {context_name}     •     Active")
+        stats.setStyleSheet("color:#9aa4af;font-size:15px;")
+        info.addWidget(endpoint)
+        info.addWidget(stats)
+
+        buttons = QVBoxLayout()
+        buttons.setSpacing(4)
+
+        # Stop button
+        stop_btn = QPushButton("Stop Tunnel")
+        stop_btn.setObjectName("dangerButton")
+        stop_btn.clicked.connect(lambda checked, lp=local_port: self.stop_forward(lp))
+        buttons.addWidget(stop_btn)
+
+        # Open in browser button (only for HTTP services – you can add condition)
+        open_btn = QPushButton("Open in Browser")
+        open_btn.setObjectName("greenButton")
+        open_btn.clicked.connect(lambda checked, lp=local_port: self.open_browser(lp))
+        buttons.addWidget(open_btn)
+
+        layout.addLayout(info)
+        layout.addStretch()
+        layout.addLayout(buttons)
+
+        self.tunnels_list.addItem(item)
+        self.tunnels_list.setItemWidget(item, widget)
+        self.active_badge.setText(f"{len(self.active_forwards)} active")
+
+    def open_browser(self, local_port):
+        """Open the default web browser at http://localhost:<port>"""
+        url = QUrl(f"http://localhost:{local_port}")
+        if not QDesktopServices.openUrl(url):
+            QMessageBox.warning(self, "Browser Error", f"Could not open browser for {url.toString()}")
 
     def stop_forward(self, local_port):
         if local_port not in self.active_forwards:
@@ -684,14 +1050,17 @@ class DockerPortForwarder(QWidget):
             info["proxy"].remove(force=True)
         except:
             pass
-        for i in range(self.active_list.count()):
-            item = self.active_list.item(i)
-            widget = self.active_list.itemWidget(item)
-            if widget and widget.layout():
-                label = widget.layout().itemAt(0).widget().text()
-                if f"localhost:{local_port}" in label:
-                    self.active_list.takeItem(i)
-                    break
+        # Remove from list widget
+        for i in range(self.tunnels_list.count()):
+            item = self.tunnels_list.item(i)
+            widget = self.tunnels_list.itemWidget(item)
+            if widget:
+                # Find the label with the port
+                for child in widget.findChildren(QLabel):
+                    if f"localhost:{local_port}" in child.text():
+                        self.tunnels_list.takeItem(i)
+                        break
+        self.active_badge.setText(f"{len(self.active_forwards)} active")
         QMessageBox.information(
             self, "Stopped", f"Forward on port {local_port} stopped."
         )
@@ -699,6 +1068,6 @@ class DockerPortForwarder(QWidget):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    window = DockerPortForwarder()
+    window = PortHoleWindow()
     window.show()
     sys.exit(app.exec())
